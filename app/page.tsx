@@ -1,11 +1,15 @@
 'use client';
-import { useState, useRef } from 'react';
-import { A3, GRID } from '@/constants/dimensions';
+import { useState, useRef, useMemo } from 'react';
+import { A3, GRID, CELL } from '@/constants/dimensions';
+import {
+  A3_MM, POLAROID_MM, PRINT_DEFAULTS, PX_PER_MM_X, PX_PER_MM_Y, computePrintLayout,
+} from '@/constants/printMode';
+import { buildPdf, verifyPdf, type PdfVerification } from '@/lib/pdf';
 import PolaroidCell from '@/components/PolaroidCell';
-import { toPng } from 'html-to-image';
+import { toPng, toJpeg } from 'html-to-image';
 import { 
   Upload, RotateCw, Trash2, 
-  Square, RectangleHorizontal, Download, ZoomIn, ZoomOut 
+  Square, RectangleHorizontal, Download, ZoomIn, ZoomOut, Printer 
 } from 'lucide-react';
 
 interface PhotoState {
@@ -16,12 +20,18 @@ interface PhotoState {
   isLandscape: boolean;
 }
 
+const makeSlot = (id: number): PhotoState => ({ id, url: null, rotation: 0, scale: 1, isLandscape: false });
+
+// Makes sure the list has at least `count` slots (Print Mode can need more than the original 16).
+const padSlots = (list: PhotoState[], count: number): PhotoState[] =>
+  list.length >= count
+    ? list
+    : [...list, ...Array.from({ length: count - list.length }, (_, k) => makeSlot(list.length + k))];
+
 export default function Home() {
   // Initialize exactly 16 slots with default data
   const [photos, setPhotos] = useState<PhotoState[]>(
-    Array.from({ length: 16 }, (_, i) => ({
-      id: i, url: null, rotation: 0, scale: 1, isLandscape: false
-    }))
+    Array.from({ length: 16 }, (_, i) => makeSlot(i))
   );
   
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -29,11 +39,33 @@ export default function Home() {
   const [zoom, setZoom] = useState(0.12);
   const canvasRef = useRef<HTMLDivElement>(null);
 
-  const selectedPhoto = selectedId !== null ? photos[selectedId] : null;
+  // --- Polaroid Print Mode (optional, off by default) ---
+  const [printMode, setPrintMode] = useState(false);
+  const [printMargin, setPrintMargin] = useState(PRINT_DEFAULTS.MARGIN_MM);
+  const [printGap, setPrintGap] = useState(PRINT_DEFAULTS.GAP_MM);
+  const [printGuides, setPrintGuides] = useState(true);
+  const [isExporting, setIsExporting] = useState(false);
+  const [pdfReport, setPdfReport] = useState<PdfVerification | null>(null);
+  const [pdfError, setPdfError] = useState<string | null>(null);
+  const savedZoom = useRef(0.12);
+
+  const printLayout = useMemo(() => computePrintLayout(printMargin, printGap), [printMargin, printGap]);
+  const slotCount = printMode ? printLayout.total : GRID.TOTAL_CELLS;
+  const shownPhotos = padSlots(photos, slotCount).slice(0, slotCount);
+
+  // The Global_Frame_Lines sliders are defined for the 877px-wide normal cell; scale them to the mini card.
+  const cardPxW = POLAROID_MM.WIDTH * PX_PER_MM_X;
+  const cardPxH = POLAROID_MM.HEIGHT * PX_PER_MM_Y;
+  const padScale = cardPxW / CELL.WIDTH;
+  const cellPadding = printMode
+    ? { x: padding.x * padScale, y: padding.y * padScale, bottom: padding.bottom * padScale }
+    : padding;
+
+  const selectedPhoto = selectedId !== null ? shownPhotos[selectedId] ?? null : null;
 
   const handleBulkUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []).slice(0, 16);
-    const newPhotos = [...photos];
+    const files = Array.from(e.target.files || []).slice(0, slotCount);
+    const newPhotos = padSlots(photos, slotCount).map(p => ({ ...p }));
     
     files.forEach((file, index) => {
       if (newPhotos[index]) {
@@ -44,7 +76,20 @@ export default function Home() {
   };
 
   const updatePhoto = (id: number, updates: Partial<PhotoState>) => {
-    setPhotos(prev => prev.map(p => p.id === id ? { ...p, ...updates } : p));
+    setPhotos(prev => padSlots(prev, id + 1).map(p => p.id === id ? { ...p, ...updates } : p));
+  };
+
+  const togglePrintMode = () => {
+    setSelectedId(null);
+    setPdfReport(null);
+    setPdfError(null);
+    if (!printMode) {
+      savedZoom.current = zoom;
+      setZoom(0.25); // cards are small, start closer
+    } else {
+      setZoom(savedZoom.current);
+    }
+    setPrintMode(!printMode);
   };
 
   const exportAsImage = async () => {
@@ -66,6 +111,83 @@ export default function Home() {
     }, 100);
   };
 
+  // Print Mode export: 300 DPI canvas -> exact 297 x 420 mm PDF, verified before download.
+  const exportAsPdf = async () => {
+    if (!canvasRef.current || isExporting || printLayout.total === 0) return;
+    setPdfReport(null);
+    setPdfError(null);
+    setSelectedId(null);
+    setIsExporting(true); // hides empty-slot placeholders + selection guides
+    try {
+      await new Promise(r => setTimeout(r, 450)); // let React re-render and CSS transitions settle
+
+      const dataUrl = await toJpeg(canvasRef.current, {
+        quality: 0.98,
+        pixelRatio: 1,
+        width: A3.WIDTH,
+        height: A3.HEIGHT,
+        backgroundColor: '#ffffff',
+        style: { transform: 'scale(1)', transformOrigin: 'top left', boxShadow: 'none', margin: '0' },
+        filter: (node) => node.dataset?.exportIgnore === undefined,
+      });
+      const jpeg = new Uint8Array(await (await fetch(dataUrl)).arrayBuffer());
+
+      const pdf = buildPdf({
+        jpeg,
+        pageWidthMm: A3_MM.WIDTH,
+        pageHeightMm: A3_MM.HEIGHT,
+        drawGuides: printGuides,
+        cards: printLayout.cards.map(c => ({
+          x: c.xMm, y: c.yMm, w: POLAROID_MM.WIDTH, h: POLAROID_MM.HEIGHT,
+        })),
+      });
+
+      const report = verifyPdf(pdf, {
+        pageWidthMm: A3_MM.WIDTH,
+        pageHeightMm: A3_MM.HEIGHT,
+        cardWidthMm: POLAROID_MM.WIDTH,
+        cardHeightMm: POLAROID_MM.HEIGHT,
+        cardCount: printLayout.total,
+        marginMm: printMargin,
+        imageWidthPx: A3.WIDTH,
+        imageHeightPx: A3.HEIGHT,
+        targetDpi: 300,
+      });
+      setPdfReport(report);
+
+      if (!report.ok) {
+        setPdfError('Verification failed - PDF not downloaded. Try Chrome or Edge (large canvas limits).');
+        return;
+      }
+
+      const url = URL.createObjectURL(new Blob([pdf.buffer], { type: 'application/pdf' }));
+      const link = document.createElement('a');
+      link.download = 'A3_Polaroid_Print_37.5x45mm.pdf';
+      link.href = url;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    } catch (err) {
+      setPdfError(err instanceof Error ? err.message : 'PDF export failed');
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const canvasStyle: React.CSSProperties = {
+    width: `${A3.WIDTH}px`,
+    height: `${A3.HEIGHT}px`,
+    minWidth: `${A3.WIDTH}px`,
+    minHeight: `${A3.HEIGHT}px`,
+    display: printMode ? 'block' : 'grid',
+    ...(printMode
+      ? { position: 'relative' }
+      : {
+          gridTemplateColumns: `repeat(${GRID.COLUMNS}, 1fr)`,
+          gridTemplateRows: `repeat(${GRID.ROWS}, 1fr)`,
+        }),
+    transform: `scale(${zoom})`,
+  };
+
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-400 flex font-mono overflow-hidden">
       {/* SIDEBAR TOOLS (LEFT) */}
@@ -77,9 +199,51 @@ export default function Home() {
 
         <section>
           <label className="flex items-center justify-center gap-2 w-full py-3 bg-blue-600 text-white text-[10px] font-bold rounded cursor-pointer hover:bg-blue-500 transition-all uppercase shadow-lg shadow-blue-900/20">
-            <Upload size={14} /> Bulk_Import_16
+            <Upload size={14} /> {printMode ? `Bulk_Import_${printLayout.total}` : 'Bulk_Import_16'}
             <input type="file" multiple accept="image/*" className="hidden" onChange={handleBulkUpload} />
           </label>
+        </section>
+
+        {/* POLAROID PRINT MODE (optional) */}
+        <section className="border border-zinc-800 rounded p-3 space-y-3">
+          <button
+            type="button"
+            role="switch"
+            aria-checked={printMode}
+            onClick={togglePrintMode}
+            className="flex w-full items-center justify-between gap-3 text-left"
+          >
+            <span>
+              <span className="flex items-center gap-2 text-zinc-200 text-[10px] font-bold uppercase tracking-tighter"><Printer size={12} /> Polaroid_Print_Mode</span>
+              <span className="block text-[9px] text-zinc-500 uppercase mt-1">Mini cards 37.5 x 45 mm</span>
+            </span>
+            <span className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${printMode ? 'bg-blue-600' : 'bg-zinc-800'}`}>
+              <span className={`absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-white transition-transform ${printMode ? 'translate-x-4' : ''}`} />
+            </span>
+          </button>
+
+          {printMode && (
+            <div className="space-y-3 pt-3 border-t border-zinc-800">
+              <div className="text-[10px] uppercase font-bold text-zinc-200">
+                {printLayout.cols} x {printLayout.rows} = <span className="text-blue-400">{printLayout.total} cards</span> on A3 (297 x 420 mm)
+              </div>
+              <div>
+                <div className="flex justify-between text-[10px] mb-1 uppercase"><span>Sheet_Margin</span><span className="text-blue-400 font-bold">{printMargin}MM</span></div>
+                <input type="range" min="3" max="20" step="0.5" value={printMargin} onChange={(e) => setPrintMargin(Number(e.target.value))} className="w-full accent-blue-500 h-1 bg-zinc-800 rounded appearance-none" />
+              </div>
+              <div>
+                <div className="flex justify-between text-[10px] mb-1 uppercase"><span>Card_Gap</span><span className="text-blue-400 font-bold">{printGap}MM</span></div>
+                <input type="range" min="0" max="5" step="0.5" value={printGap} onChange={(e) => setPrintGap(Number(e.target.value))} className="w-full accent-blue-500 h-1 bg-zinc-800 rounded appearance-none" />
+              </div>
+              <label className="flex items-center gap-2 text-[10px] uppercase cursor-pointer">
+                <input type="checkbox" checked={printGuides} onChange={(e) => setPrintGuides(e.target.checked)} className="accent-blue-500" />
+                Cut_Guides_In_PDF
+              </label>
+              {printLayout.total === 0 && (
+                <div className="text-[10px] text-red-400 uppercase">Margin too large - no card fits.</div>
+              )}
+            </div>
+          )}
         </section>
 
         <section className="flex-1 space-y-6">
@@ -123,6 +287,36 @@ export default function Home() {
           </div>
         </section>
 
+        {/* PRINT MODE EXPORT */}
+        {printMode && (
+          <div className="space-y-2">
+            <button
+              onClick={exportAsPdf}
+              disabled={isExporting || printLayout.total === 0}
+              className="w-full py-4 bg-blue-600 text-white font-black text-xs hover:bg-blue-500 disabled:opacity-50 disabled:cursor-wait flex items-center justify-center gap-2 transition-all shadow-xl"
+            >
+              <Printer size={16} /> {isExporting ? 'BUILDING_A3_PDF...' : 'DOWNLOAD_A3_PRINT_PDF'}
+            </button>
+            <p className="text-[10px] text-zinc-200 font-bold leading-snug">
+              Print on A3 paper at 100% / Actual Size.
+            </p>
+            <p className="text-[9px] text-zinc-500 leading-snug">
+              Turn off &quot;Fit to page&quot; / &quot;Shrink to fit&quot; in the print dialog.
+            </p>
+
+            {pdfError && <div className="text-[10px] text-red-400 leading-snug">{pdfError}</div>}
+            {pdfReport && (
+              <ul className="space-y-1 text-[9px] leading-snug">
+                {pdfReport.checks.map((c) => (
+                  <li key={c.label} className={c.ok ? 'text-zinc-400' : 'text-red-400'}>
+                    <span className={`font-bold ${c.ok ? 'text-green-500' : 'text-red-500'}`}>{c.ok ? 'OK' : 'FAIL'}</span> {c.label}: {c.detail}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
         <button onClick={exportAsImage} className="py-4 bg-zinc-100 text-black font-black text-xs hover:bg-white flex items-center justify-center gap-2 transition-all shadow-xl">
           <Download size={16} /> DOWNLOAD_A3_PNG
         </button>
@@ -139,34 +333,60 @@ export default function Home() {
           ref={canvasRef}
           id="a3-canvas"
           className="bg-white shadow-[0_0_100px_rgba(0,0,0,0.8)] flex-shrink-0 origin-top mb-40"
-          style={{
-            width: `${A3.WIDTH}px`,
-            height: `${A3.HEIGHT}px`,
-            minWidth: `${A3.WIDTH}px`,
-            minHeight: `${A3.HEIGHT}px`,
-            display: 'grid',
-            gridTemplateColumns: `repeat(${GRID.COLUMNS}, 1fr)`,
-            gridTemplateRows: `repeat(${GRID.ROWS}, 1fr)`,
-            transform: `scale(${zoom})`,
-          }}
+          style={canvasStyle}
         >
-          {photos.map((photo, i) => (
-            <div 
-              key={i} 
-              onClick={() => setSelectedId(i)}
-              className={`relative cursor-pointer transition-all duration-200 ${
-                selectedId === i 
-                  ? 'ring-[20px] ring-blue-500 ring-inset z-50 shadow-2xl' 
-                  : 'border-[0.5px] border-zinc-100'
-              }`}
-            >
-              <PolaroidCell 
-                data={photo} 
-                secondaryPadding={padding} 
-                onReplace={(url) => updatePhoto(i, { url })}
-              />
-            </div>
-          ))}
+          {printMode
+            ? printLayout.cards.map((c) => {
+                const photo = shownPhotos[c.index];
+                const selected = selectedId === c.index;
+                return (
+                  <div
+                    key={c.index}
+                    onClick={() => setSelectedId(c.index)}
+                    className="absolute cursor-pointer"
+                    style={{
+                      left: `${c.xMm * PX_PER_MM_X}px`,
+                      top: `${c.yMm * PX_PER_MM_Y}px`,
+                      width: `${cardPxW}px`,
+                      height: `${cardPxH}px`,
+                    }}
+                  >
+                    <PolaroidCell
+                      data={photo}
+                      secondaryPadding={cellPadding}
+                      onReplace={(url) => updatePhoto(c.index, { url })}
+                      compact
+                      hideUi={isExporting}
+                    />
+                    {/* preview-only card outline / selection ring (never exported) */}
+                    <div
+                      data-export-ignore
+                      className="absolute inset-0 pointer-events-none"
+                      style={{
+                        zIndex: selected ? 50 : 1,
+                        boxShadow: selected ? 'inset 0 0 0 10px #3b82f6' : 'inset 0 0 0 6px #d4d4d8',
+                      }}
+                    />
+                  </div>
+                );
+              })
+            : photos.slice(0, GRID.TOTAL_CELLS).map((photo, i) => (
+                <div 
+                  key={i} 
+                  onClick={() => setSelectedId(i)}
+                  className={`relative cursor-pointer transition-all duration-200 ${
+                    selectedId === i 
+                      ? 'ring-[20px] ring-blue-500 ring-inset z-50 shadow-2xl' 
+                      : 'border-[0.5px] border-zinc-100'
+                  }`}
+                >
+                  <PolaroidCell 
+                    data={photo} 
+                    secondaryPadding={cellPadding} 
+                    onReplace={(url) => updatePhoto(i, { url })}
+                  />
+                </div>
+              ))}
         </div>
       </main>
     </div>
